@@ -12,6 +12,7 @@ import math
 import pyaudio
 import struct
 import queue
+import colorsys
 from pygame import gfxdraw
 
 # --- Project Specific Imports ---
@@ -37,7 +38,9 @@ logging.basicConfig(
 )
 
 # Define keywords that will trigger the assistant to stop listening
-EXIT_COMMANDS = {"goodbye", "exit", "quit", "stop listening", "power down"}
+EXIT_COMMANDS = {"goodbye", "exit", "quit", "stop listening", "power down", "go to bed mk1"}
+STOP_LISTENING_COMMAND = "over and out"
+SHUTDOWN_COMMAND = "go to bed mk1"
 
 # Audio visualization constants
 CHUNK = 1024
@@ -160,8 +163,9 @@ class JarvisInterface:
         self.is_listening = False
         self.is_speaking = False
         self.is_processing = False
+        self.is_active = True  # Controls if system is generally active or in "sleep" mode
         
-        # Start audio processing
+        # Start audio processing for visualizations
         self.audio_processor.start()
     
     def on_audio_data(self, audio_data):
@@ -192,15 +196,21 @@ class JarvisInterface:
         else:
             pulse_intensity = pulse * 0.5
         
+        # If system is in sleep mode, dim the reactor
+        if not self.is_active:
+            dim_factor = 0.3  # Dim to 30% brightness
+        else:
+            dim_factor = 1.0
+        
         # Draw reactor rings
         ring_count = 5
         for i in range(ring_count):
             size = (ring_count - i) * (self.reactor_size / ring_count) * pulse_factor
-            ring_alpha = int(255 * (0.5 + 0.5 * (ring_count - i) / ring_count))
+            ring_alpha = int(255 * dim_factor * (0.5 + 0.5 * (ring_count - i) / ring_count))
             ring_color = (
-                min(255, int(TEXT_COLOR[0] * (1 + pulse_intensity * 0.5))),
-                min(255, int(TEXT_COLOR[1] * (1 + pulse_intensity * 0.2))),
-                min(255, int(TEXT_COLOR[2]))
+                min(255, int(TEXT_COLOR[0] * dim_factor * (1 + pulse_intensity * 0.5))),
+                min(255, int(TEXT_COLOR[1] * dim_factor * (1 + pulse_intensity * 0.2))),
+                min(255, int(TEXT_COLOR[2] * dim_factor))
             )
             
             # Draw anti-aliased circle
@@ -214,7 +224,7 @@ class JarvisInterface:
             
             # Only fill inner circles
             if i >= ring_count - 2:
-                glow_alpha = int(100 * pulse)
+                glow_alpha = int(100 * pulse * dim_factor)
                 gfxdraw.filled_circle(
                     self.screen,
                     self.reactor_x,
@@ -225,16 +235,21 @@ class JarvisInterface:
         
         # Draw core
         core_size = 20 * pulse_factor
+        core_color = (
+            int(TEXT_COLOR[0] * dim_factor),
+            int(TEXT_COLOR[1] * dim_factor),
+            int(TEXT_COLOR[2] * dim_factor)
+        )
         gfxdraw.filled_circle(
             self.screen,
             self.reactor_x,
             self.reactor_y,
             int(core_size),
-            TEXT_COLOR
+            core_color
         )
         
-        # Draw audio waveform around the reactor
-        if len(self.audio_data) > 0:
+        # Draw audio waveform around the reactor (only if active)
+        if self.is_active and len(self.audio_data) > 0:
             for i in range(0, len(self.audio_data), 8):  # Sample every 8th point for performance
                 angle = 2 * math.pi * i / len(self.audio_data)
                 amplitude = self.audio_data[i] * 100 * pulse_factor  # Scale amplitude
@@ -252,7 +267,7 @@ class JarvisInterface:
                 # Draw line with thickness based on amplitude
                 pygame.draw.line(
                     self.screen,
-                    TEXT_COLOR,
+                    core_color,
                     (start_x, start_y),
                     (end_x, end_y),
                     max(1, int(abs(amplitude) / 10))
@@ -260,6 +275,9 @@ class JarvisInterface:
     
     def draw_spectrum(self):
         """Draw audio spectrum visualization"""
+        if not self.is_active:
+            return  # Don't draw spectrum in sleep mode
+            
         if len(self.audio_data) > 0:
             # Calculate FFT for spectrum display
             spectrum = np.abs(np.fft.rfft(self.audio_data)) / len(self.audio_data)
@@ -301,13 +319,14 @@ class JarvisInterface:
     def draw_conversation(self):
         """Draw the conversation history"""
         # Title
-        title_surface = self.title_font.render("CONVERSATION LOG", True, TEXT_COLOR)
+        title_color = TEXT_COLOR if self.is_active else (TEXT_COLOR[0]//2, TEXT_COLOR[1]//2, TEXT_COLOR[2]//2)
+        title_surface = self.title_font.render("CONVERSATION LOG", True, title_color)
         self.screen.blit(title_surface, (WINDOW_WIDTH - 400, 30))
         
         # Draw divider line
         pygame.draw.line(
             self.screen,
-            TEXT_COLOR,
+            title_color,
             (WINDOW_WIDTH - 420, 60),
             (WINDOW_WIDTH - 20, 60),
             1
@@ -324,6 +343,10 @@ class JarvisInterface:
             # Choose color based on speaker
             color = USER_TEXT_COLOR if speaker == "User" else TEXT_COLOR
             
+            # If in sleep mode, dim the colors
+            if not self.is_active:
+                color = (color[0]//2, color[1]//2, color[2]//2)
+                
             # Render speaker label
             speaker_surface = self.text_font.render(f"{speaker}:", True, color)
             self.screen.blit(speaker_surface, (WINDOW_WIDTH - 400, y_pos))
@@ -363,7 +386,7 @@ class JarvisInterface:
         # Status area background
         status_rect = pygame.Rect(20, WINDOW_HEIGHT - 50, WINDOW_WIDTH - 40, 30)
         pygame.draw.rect(self.screen, (20, 20, 30), status_rect)
-        pygame.draw.rect(self.screen, TEXT_COLOR, status_rect, 1)
+        pygame.draw.rect(self.screen, TEXT_COLOR if self.is_active else (TEXT_COLOR[0]//2, TEXT_COLOR[1]//2, TEXT_COLOR[2]//2), status_rect, 1)
         
         # Status indicators
         status_text = f"STATUS: {self.status_message}"
@@ -373,14 +396,16 @@ class JarvisInterface:
             status_text += " | SPEAKING"
         if self.is_processing:
             status_text += " | PROCESSING"
+        if not self.is_active:
+            status_text += " | SLEEP MODE"
         
         # Draw status text
-        status_surface = self.status_font.render(status_text, True, TEXT_COLOR)
+        status_surface = self.status_font.render(status_text, True, TEXT_COLOR if self.is_active else (TEXT_COLOR[0]//2, TEXT_COLOR[1]//2, TEXT_COLOR[2]//2))
         self.screen.blit(status_surface, (30, WINDOW_HEIGHT - 40))
         
         # System time
         time_str = time.strftime("%H:%M:%S", time.localtime())
-        time_surface = self.status_font.render(time_str, True, TEXT_COLOR)
+        time_surface = self.status_font.render(time_str, True, TEXT_COLOR if self.is_active else (TEXT_COLOR[0]//2, TEXT_COLOR[1]//2, TEXT_COLOR[2]//2))
         self.screen.blit(time_surface, (WINDOW_WIDTH - 100, WINDOW_HEIGHT - 40))
     
     def draw(self):
@@ -412,10 +437,37 @@ class JarvisInterface:
         self.is_speaking = is_speaking
         self.is_processing = is_processing
     
+    def set_active_state(self, active):
+        """Set active/sleep state of the interface"""
+        self.is_active = active
+        if active:
+            self.status_message = "SYSTEM ACTIVATED"
+        else:
+            self.status_message = "SLEEP MODE"
+    
     def cleanup(self):
         """Clean up resources before quitting"""
         self.audio_processor.cleanup()
         pygame.quit()
+
+
+class MockAgent:
+    """
+    A mock agent class that simulates the interface for the AI agent.
+    Only to be used if actual agent module is not available.
+    """
+    def __init__(self):
+        self.last_response = None
+        logging.warning("Using mock agent - actual NLP functionality is not available")
+    
+    def process_command(self, command):
+        """Process a command and return a response"""
+        self.last_response = f"I would process '{command}' if I were a real agent."
+        return self.last_response
+    
+    def get_last_response(self):
+        """Get the last response generated by the agent"""
+        return self.last_response
 
 
 def main():
@@ -433,8 +485,13 @@ def main():
         logging.info("Voice I/O initialized.")
 
         # Initialize the Agent
-        ai_agent = agent.Agent()
-        logging.info("AI Agent initialized.")
+        try:
+            ai_agent = agent.Agent()
+            logging.info("AI Agent initialized.")
+        except (ImportError, AttributeError) as e:
+            logging.error(f"Failed to initialize Agent module: {e}")
+            logging.warning("Using mock agent instead.")
+            ai_agent = MockAgent()
 
     except Exception as e:
         logging.error(f"Initialization failed: {e}")
@@ -452,6 +509,13 @@ def main():
     speak_thread = None
     listen_thread = None
     process_thread = None
+    
+    # Function to check if all active threads have completed
+    def all_threads_complete():
+        """Check if all processing threads have completed"""
+        return (not speak_thread or not speak_thread.is_alive()) and \
+               (not listen_thread or not listen_thread.is_alive()) and \
+               (not process_thread or not process_thread.is_alive())
     
     def speak_in_background(text):
         """Function to speak text in a background thread"""
@@ -495,8 +559,20 @@ def main():
                     running = False
                 elif event.key == pygame.K_SPACE:
                     # Space key triggers listening
-                    if not listen_thread or not listen_thread.is_alive():
+                    if all_threads_complete():
                         start_listening = True
+                elif event.key == pygame.K_s:
+                    # 'S' key toggles sleep/active mode
+                    if all_threads_complete():
+                        interface.set_active_state(not interface.is_active)
+                        if interface.is_active:
+                            speak_thread = threading.Thread(target=speak_in_background, args=("System activated and ready for commands.",))
+                            speak_thread.daemon = True
+                            speak_thread.start()
+                        else:
+                            speak_thread = threading.Thread(target=speak_in_background, args=("Entering sleep mode.",))
+                            speak_thread.daemon = True
+                            speak_thread.start()
         
         # Update interface state
         interface.update()
@@ -504,74 +580,86 @@ def main():
         # Draw the interface
         interface.draw()
         
-        # Start listening when previous threads are done
-        if start_listening and (not listen_thread or not listen_thread.is_alive()) and \
-           (not speak_thread or not speak_thread.is_alive()) and \
-           (not process_thread or not process_thread.is_alive()):
-            
-            listen_thread = threading.Thread(target=listen_in_background)
-            listen_thread.daemon = True
-            listen_thread.start()
-            start_listening = False
-            
-            # Wait a bit before checking for results
-            time.sleep(0.1)
-        
-        # Check if listening is complete and process the result
-        if listen_thread and not listen_thread.is_alive() and not process_thread:
-            user_input = speech_processor.get_last_input()
-            
-            if user_input:
-                logging.info(f"User said: {user_input}")
-                interface.add_to_conversation("User", user_input)
+        # Only process voice interactions if system is active
+        if interface.is_active:
+            # Start listening when previous threads are done
+            if start_listening and all_threads_complete():
+                listen_thread = threading.Thread(target=listen_in_background)
+                listen_thread.daemon = True
+                listen_thread.start()
+                start_listening = False
                 
-                # Check for exit command
-                if user_input.lower().strip() in EXIT_COMMANDS:
-                    farewell = "Powering down. Goodbye!"
-                    logging.info(f"Assistant: {farewell}")
-                    interface.add_to_conversation("Assistant", farewell)
+                # Wait a bit before checking for results
+                time.sleep(0.1)
+            
+            # Check if listening is complete and process the result
+            if listen_thread and not listen_thread.is_alive() and not process_thread:
+                user_input = speech_processor.get_last_input()
+                
+                if user_input:
+                    logging.info(f"User said: {user_input}")
+                    interface.add_to_conversation("User", user_input)
                     
-                    # Speak farewell and then exit
-                    speak_thread = threading.Thread(target=speak_in_background, args=(farewell,))
+                    # Check for exit command
+                    if any(cmd in user_input.lower() for cmd in EXIT_COMMANDS):
+                        farewell = "Powering down. Goodbye!"
+                        logging.info(f"Assistant: {farewell}")
+                        interface.add_to_conversation("Assistant", farewell)
+                        
+                        # Speak farewell and then exit
+                        speak_thread = threading.Thread(target=speak_in_background, args=(farewell,))
+                        speak_thread.daemon = True
+                        speak_thread.start()
+                        
+                        # Wait for speak thread to finish
+                        speak_thread.join(timeout=5)
+                        running = False
+                    # Check for sleep command
+                    elif STOP_LISTENING_COMMAND.lower() in user_input.lower():
+                        sleep_msg = "Stopping active listening."
+                        logging.info(f"Assistant: {sleep_msg}")
+                        interface.add_to_conversation("Assistant", sleep_msg)
+                        
+                        # Speak sleep message
+                        speak_thread = threading.Thread(target=speak_in_background, args=(sleep_msg,))
+                        speak_thread.daemon = True
+                        speak_thread.start()
+                        
+                        # Set to sleep mode
+                        interface.set_active_state(False)
+                    else:
+                        # Process command in background
+                        process_thread = threading.Thread(target=process_in_background, args=(user_input,))
+                        process_thread.daemon = True
+                        process_thread.start()
+            
+            # Check if processing is complete and speak the result
+            if process_thread and not process_thread.is_alive() and not speak_thread:
+                response = ai_agent.get_last_response()
+                
+                if response:
+                    logging.info(f"Agent response: {response}")
+                    interface.add_to_conversation("Assistant", response)
+                    
+                    # Speak the response
+                    speak_thread = threading.Thread(target=speak_in_background, args=(response,))
                     speak_thread.daemon = True
                     speak_thread.start()
-                    
-                    # Wait for speak thread to finish
-                    speak_thread.join(timeout=5)
-                    running = False
                 else:
-                    # Process command in background
-                    process_thread = threading.Thread(target=process_in_background, args=(user_input,))
-                    process_thread.daemon = True
-                    process_thread.start()
-        
-        # Check if processing is complete and speak the result
-        if process_thread and not process_thread.is_alive() and not speak_thread:
-            response = ai_agent.get_last_response()
-            
-            if response:
-                logging.info(f"Agent response: {response}")
-                interface.add_to_conversation("Assistant", response)
+                    # Handle cases where the agent might not return a response
+                    error_msg = "I encountered an issue processing that request."
+                    logging.warning("Agent did not provide a response.")
+                    interface.add_to_conversation("Assistant", error_msg)
+                    
+                    speak_thread = threading.Thread(target=speak_in_background, args=(error_msg,))
+                    speak_thread.daemon = True
+                    speak_thread.start()
                 
-                # Speak the response
-                speak_thread = threading.Thread(target=speak_in_background, args=(response,))
-                speak_thread.daemon = True
-                speak_thread.start()
-            else:
-                # Handle cases where the agent might not return a response
-                error_msg = "I encountered an issue processing that request."
-                logging.warning("Agent did not provide a response.")
-                interface.add_to_conversation("Assistant", error_msg)
+                # Clear the process thread
+                process_thread = None
                 
-                speak_thread = threading.Thread(target=speak_in_background, args=(error_msg,))
-                speak_thread.daemon = True
-                speak_thread.start()
-            
-            # Clear the process thread
-            process_thread = None
-            
-            # Flag to start listening again after speaking is done
-            start_listening = True
+                # Flag to start listening again after speaking is done
+                start_listening = True
         
         # Cap the frame rate
         interface.clock.tick(60)
