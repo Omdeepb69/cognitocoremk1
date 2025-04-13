@@ -1,299 +1,457 @@
-# tools.py
-
 """
-Implements the agent's callable functions (tools):
-- Web searching/scraping
-- System command execution
-- Email composition/sending
-- System status retrieval
+Collection of tools for web access, system commands, emails, and more
 """
-
 import os
-import subprocess
-import smtplib
-import ssl
+import sys
+import json
+import time
 import logging
-import shlex
-from email.message import EmailMessage
-from typing import List, Dict, Union, Optional
-
+import smtplib
+import subprocess
 import requests
-from bs4 import BeautifulSoup
 import psutil
-from duckduckgo_search import DDGS
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.utils import formataddr
+from typing import Dict, List, Any, Optional, Tuple
+from bs4 import BeautifulSoup
+from twilio.rest import Client
 
-# Attempt to import configuration, handle potential ImportError
-try:
-    from config import (
-        SMTP_SERVER, SMTP_PORT, SMTP_USERNAME,
-        SMTP_PASSWORD, SENDER_EMAIL, ALLOWED_COMMANDS
-    )
-    CONFIG_LOADED = True
-except ImportError:
-    logging.warning("Could not import configuration from config.py. Email and specific command execution might be limited.")
-    CONFIG_LOADED = False
-    # Define placeholders if config is missing, email won't work
-    SMTP_SERVER = None
-    SMTP_PORT = None
-    SMTP_USERNAME = None
-    SMTP_PASSWORD = None
-    SENDER_EMAIL = None
-    ALLOWED_COMMANDS = ["ls", "dir", "pwd", "echo", "ping", "netstat", "ipconfig", "ifconfig", "date", "time", "whoami"] # Default safe commands
+import config
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(f"{config.LOG_DIR}/tools.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("tools")
 
-# --- Tool Functions ---
-
-def search_web(query: str, num_results: int = 5) -> str:
-    """
-    Performs a web search using DuckDuckGo and returns summarized results.
-
-    Args:
-        query: The search query string.
-        num_results: The maximum number of search results to return.
-
-    Returns:
-        A string containing the search results, or an error message.
-    """
-    logging.info(f"Performing web search for: {query}")
-    results_str = f"Search results for '{query}':\n"
-    try:
-        with DDGS() as ddgs:
-            search_results = list(ddgs.text(query, max_results=num_results))
-
-        if not search_results:
-            return f"No search results found for '{query}'."
-
-        for i, result in enumerate(search_results, 1):
-            results_str += f"{i}. {result.get('title', 'No Title')}\n"
-            results_str += f"   URL: {result.get('href', 'No URL')}\n"
-            results_str += f"   Snippet: {result.get('body', 'No Snippet')}\n\n"
-
-        # Optional: Fetch content from the top result (be mindful of website terms of service)
-        # try:
-        #     top_url = search_results[0].get('href')
-        #     if top_url:
-        #         response = requests.get(top_url, timeout=10, headers={'User-Agent': 'CognitoCoreMk1/1.0'})
-        #         response.raise_for_status()
-        #         soup = BeautifulSoup(response.text, 'html.parser')
-        #         # Extract relevant text (this needs refinement based on common page structures)
-        #         paragraphs = soup.find_all('p', limit=3)
-        #         content_summary = "\n".join([p.get_text() for p in paragraphs])
-        #         if content_summary:
-        #             results_str += f"--- Top Result Content Summary ---\n{content_summary}\n-------------------------------\n"
-        # except requests.RequestException as e:
-        #     logging.warning(f"Could not fetch content from top result {top_url}: {e}")
-        # except Exception as e:
-        #      logging.warning(f"Error parsing content from {top_url}: {e}")
-
-
-        return results_str.strip()
-
-    except Exception as e:
-        logging.error(f"Web search failed for query '{query}': {e}", exc_info=True)
-        return f"An error occurred during the web search: {e}"
-
-def execute_system_command(command: str) -> str:
-    """
-    Executes a system command if it's in the allowed list.
-
-    Args:
-        command: The command string to execute.
-
-    Returns:
-        A string containing the command's stdout and stderr, or an error message.
-    """
-    logging.info(f"Attempting to execute system command: {command}")
-
-    if not CONFIG_LOADED and not ALLOWED_COMMANDS:
-         return "Error: Command execution is disabled because configuration could not be loaded."
-
-    try:
-        # Use shlex.split for safer argument parsing
-        args = shlex.split(command)
-        base_command = args[0]
-
-        # Security Check: Only allow commands from the predefined list
-        if base_command not in ALLOWED_COMMANDS:
-            logging.warning(f"Execution denied for disallowed command: {command}")
-            return f"Error: Command '{base_command}' is not allowed."
-
-        # Execute the command
-        result = subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            check=False,  # Don't raise exception on non-zero exit code
-            timeout=30  # Add a timeout for safety
-        )
-
-        output = f"Command: '{command}'\n"
-        output += f"Return Code: {result.returncode}\n"
-        if result.stdout:
-            output += f"--- STDOUT ---\n{result.stdout.strip()}\n"
-        if result.stderr:
-            output += f"--- STDERR ---\n{result.stderr.strip()}\n"
-
-        logging.info(f"Command '{command}' executed with return code {result.returncode}")
-        return output.strip()
-
-    except FileNotFoundError:
-        logging.error(f"Command not found: {args[0]}")
-        return f"Error: Command not found: {args[0]}"
-    except subprocess.TimeoutExpired:
-        logging.error(f"Command timed out: {command}")
-        return f"Error: Command '{command}' timed out after 30 seconds."
-    except Exception as e:
-        logging.error(f"Failed to execute command '{command}': {e}", exc_info=True)
-        return f"An unexpected error occurred while executing the command: {e}"
-
-def send_email(recipient: str, subject: str, body: str) -> str:
-    """
-    Sends an email using SMTP configuration from config.py.
-
-    Args:
-        recipient: The email address of the recipient.
-        subject: The subject line of the email.
-        body: The main content/body of the email.
-
-    Returns:
-        A string indicating success or failure.
-    """
-    logging.info(f"Attempting to send email to: {recipient}")
-
-    if not CONFIG_LOADED or not all([SMTP_SERVER, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD, SENDER_EMAIL]):
-        logging.error("Email configuration is missing or incomplete in config.py.")
-        return "Error: Email configuration is missing or incomplete. Cannot send email."
-
-    msg = EmailMessage()
-    msg['Subject'] = subject
-    msg['From'] = SENDER_EMAIL
-    msg['To'] = recipient
-    msg.set_content(body)
-
-    try:
-        # Establish secure connection
-        context = ssl.create_default_context()
-        if SMTP_PORT == 465: # Typically SSL
-             server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=context)
-        else: # Typically STARTTLS (e.g., port 587)
-             server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=10)
-             server.starttls(context=context) # Secure the connection
-
-        # Login and send
-        server.login(SMTP_USERNAME, SMTP_PASSWORD)
-        server.send_message(msg)
-        server.quit()
-        logging.info(f"Email successfully sent to {recipient} with subject '{subject}'")
-        return f"Email successfully sent to {recipient}."
-
-    except smtplib.SMTPAuthenticationError:
-        logging.error("SMTP Authentication failed. Check username/password.")
-        return "Error: Email authentication failed. Please check credentials."
-    except smtplib.SMTPConnectError:
-        logging.error(f"Failed to connect to SMTP server: {SMTP_SERVER}:{SMTP_PORT}")
-        return "Error: Could not connect to the email server."
-    except smtplib.SMTPSenderRefused:
-         logging.error(f"Sender address {SENDER_EMAIL} refused by the server.")
-         return f"Error: Sender address {SENDER_EMAIL} was refused."
-    except smtplib.SMTPRecipientsRefused:
-         logging.error(f"Recipient address {recipient} refused by the server.")
-         return f"Error: Recipient address {recipient} was refused."
-    except TimeoutError:
-         logging.error("Connection to SMTP server timed out.")
-         return "Error: Connection to the email server timed out."
-    except Exception as e:
-        logging.error(f"Failed to send email: {e}", exc_info=True)
-        return f"An unexpected error occurred while sending the email: {e}"
-
-def get_system_status() -> str:
-    """
-    Retrieves basic system status information (CPU, Memory, Disk).
-
-    Returns:
-        A string summarizing the current system status.
-    """
-    logging.info("Retrieving system status.")
-    try:
-        # CPU Usage
-        cpu_percent = psutil.cpu_percent(interval=1) # Check over 1 second
-
-        # Memory Usage
-        memory_info = psutil.virtual_memory()
-        memory_percent = memory_info.percent
-        memory_total_gb = round(memory_info.total / (1024**3), 2)
-        memory_available_gb = round(memory_info.available / (1024**3), 2)
-
-        # Disk Usage (Root partition)
-        # Use '/' for Unix-like systems, 'C:\\' for Windows as a common default
-        disk_path = '/' if os.name != 'nt' else 'C:\\'
+class WebTools:
+    """Tools for web search and information retrieval"""
+    
+    @staticmethod
+    def search_web(query: str, num_results: int = 5) -> List[Dict[str, str]]:
+        """
+        Perform a web search and return results
+        
+        Args:
+            query: Search query
+            num_results: Number of results to return
+            
+        Returns:
+            List of dictionaries with search results
+        """
         try:
-            disk_info = psutil.disk_usage(disk_path)
-            disk_percent = disk_info.percent
-            disk_total_gb = round(disk_info.total / (1024**3), 2)
-            disk_free_gb = round(disk_info.free / (1024**3), 2)
-            disk_status = (f"Disk Usage ({disk_path}): {disk_percent}% "
-                           f"(Free: {disk_free_gb} GB / Total: {disk_total_gb} GB)")
-        except FileNotFoundError:
-             disk_status = f"Disk Usage ({disk_path}): Path not found."
+            # This is a simplified version that would be replaced with a real search API
+            # Like Google Custom Search API, Bing Search API, or SerpAPI
+            logger.info(f"Searching web for: {query}")
+            
+            # Mockup search - in a real application, use an actual search API
+            headers = {
+                'User-Agent': 'CognitoCoreMk1/1.0 (Educational Project)'
+            }
+            
+            # Use a search engine that allows scraping or better yet, a proper API
+            search_url = f"https://duckduckgo.com/html/?q={query}"
+            response = requests.get(search_url, headers=headers)
+            
+            if response.status_code != 200:
+                return [{"title": "Search failed", "url": "", "snippet": f"Error: {response.status_code}"}]
+            
+            # Parse results with BeautifulSoup
+            soup = BeautifulSoup(response.text, 'html.parser')
+            results = []
+            
+            # This is a simplified parser for DuckDuckGo
+            # In a real application, use proper selectors based on the search engine
+            for result in soup.select('.result')[:num_results]:
+                title_elem = result.select_one('.result__title')
+                link_elem = result.select_one('.result__url')
+                snippet_elem = result.select_one('.result__snippet')
+                
+                title = title_elem.text if title_elem else "No title"
+                url = link_elem.text if link_elem else "#"
+                snippet = snippet_elem.text if snippet_elem else "No description"
+                
+                results.append({
+                    "title": title,
+                    "url": url,
+                    "snippet": snippet
+                })
+            
+            return results
+            
         except Exception as e:
-            logging.warning(f"Could not get disk usage for {disk_path}: {e}")
-            disk_status = f"Disk Usage ({disk_path}): Error retrieving status."
+            logger.error(f"Error in web search: {str(e)}")
+            return [{"title": "Search error", "url": "", "snippet": f"An error occurred: {str(e)}"}]
+    
+    @staticmethod
+    def fetch_webpage_content(url: str) -> str:
+        """
+        Fetch and extract content from a webpage
+        
+        Args:
+            url: URL of the webpage to fetch
+            
+        Returns:
+            Extracted text content from the webpage
+        """
+        try:
+            logger.info(f"Fetching content from: {url}")
+            
+            headers = {
+                'User-Agent': 'CognitoCoreMk1/1.0 (Educational Project)'
+            }
+            
+            response = requests.get(url, headers=headers)
+            
+            if response.status_code != 200:
+                return f"Failed to fetch page. Status code: {response.status_code}"
+            
+            # Parse with BeautifulSoup
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Remove script and style elements
+            for script in soup(["script", "style", "header", "footer", "nav"]):
+                script.extract()
+            
+            # Extract text
+            text = soup.get_text(separator='\n')
+            
+            # Clean up text
+            lines = (line.strip() for line in text.splitlines())
+            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+            text = '\n'.join(chunk for chunk in chunks if chunk)
+            
+            # Limit text length to avoid overwhelming the AI
+            max_length = 5000
+            if len(text) > max_length:
+                text = text[:max_length] + "...\n[Content truncated due to length]"
+            
+            return text
+            
+        except Exception as e:
+            logger.error(f"Error fetching webpage: {str(e)}")
+            return f"Failed to fetch webpage content: {str(e)}"
 
 
-        status_report = (
-            f"--- System Status ---\n"
-            f"CPU Usage: {cpu_percent}%\n"
-            f"Memory Usage: {memory_percent}% (Available: {memory_available_gb} GB / Total: {memory_total_gb} GB)\n"
-            f"{disk_status}\n"
-            f"---------------------"
-        )
-        logging.info("System status retrieved successfully.")
-        return status_report
+class SystemTools:
+    """Tools for system interaction and management"""
+    
+    @staticmethod
+    def run_command(command: str, safe_mode: bool = True) -> Dict[str, Any]:
+        """
+        Run a system command and return the output
+        
+        Args:
+            command: Command to execute
+            safe_mode: If True, restricts to safe commands only
+            
+        Returns:
+            Dict with command output and status
+        """
+        try:
+            logger.info(f"Running system command: {command}")
+            
+            # List of allowed commands in safe mode
+            safe_commands = [
+                'ls', 'dir', 'echo', 'date', 'time', 'whoami', 
+                'pwd', 'cd', 'hostname', 'ping', 'python', 'python3',
+                'pip', 'pip3', 'type', 'cat', 'more'
+            ]
+            
+            # Check if command is allowed in safe mode
+            command_base = command.split()[0].lower()
+            if safe_mode and command_base not in safe_commands:
+                return {
+                    "output": f"Command '{command_base}' not allowed in safe mode",
+                    "status": "denied",
+                    "error": "Security restriction"
+                }
+            
+            # Run the command and capture output
+            process = subprocess.Popen(
+                command,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            
+            stdout, stderr = process.communicate(timeout=30)
+            
+            return {
+                "output": stdout,
+                "error": stderr if stderr else None,
+                "status": "success" if process.returncode == 0 else "error",
+                "code": process.returncode
+            }
+            
+        except subprocess.TimeoutExpired:
+            logger.error(f"Command timed out: {command}")
+            return {
+                "output": "",
+                "error": "Command execution timed out",
+                "status": "timeout",
+                "code": -1
+            }
+        except Exception as e:
+            logger.error(f"Error running command: {str(e)}")
+            return {
+                "output": "",
+                "error": str(e),
+                "status": "error",
+                "code": -1
+            }
+    
+    @staticmethod
+    def get_system_info() -> Dict[str, Any]:
+        """
+        Get system information
+        
+        Returns:
+            Dict with system information
+        """
+        try:
+            logger.info("Collecting system information")
+            
+            # CPU info
+            cpu_percent = psutil.cpu_percent(interval=1)
+            cpu_freq = psutil.cpu_freq()
+            cpu_count = psutil.cpu_count(logical=True)
+            
+            # Memory info
+            memory = psutil.virtual_memory()
+            
+            # Disk info
+            disk = psutil.disk_usage('/')
+            
+            # Network info
+            net_io = psutil.net_io_counters()
+            
+            # Battery info (if available)
+            battery = None
+            if hasattr(psutil, "sensors_battery") and psutil.sensors_battery():
+                battery_stats = psutil.sensors_battery()
+                battery = {
+                    "percent": battery_stats.percent,
+                    "power_plugged": battery_stats.power_plugged,
+                    "seconds_left": battery_stats.secsleft
+                }
+            
+            # System uptime
+            boot_time = psutil.boot_time()
+            uptime = time.time() - boot_time
+            
+            return {
+                "cpu": {
+                    "percent": cpu_percent,
+                    "frequency": cpu_freq.current if cpu_freq else None,
+                    "cores": cpu_count
+                },
+                "memory": {
+                    "total": memory.total,
+                    "available": memory.available,
+                    "percent": memory.percent
+                },
+                "disk": {
+                    "total": disk.total,
+                    "free": disk.free,
+                    "percent": disk.percent
+                },
+                "network": {
+                    "bytes_sent": net_io.bytes_sent,
+                    "bytes_recv": net_io.bytes_recv
+                },
+                "battery": battery,
+                "uptime": {
+                    "seconds": uptime,
+                    "formatted": f"{int(uptime // 86400)}d {int((uptime % 86400) // 3600)}h {int((uptime % 3600) // 60)}m"
+                },
+                "boot_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(boot_time)),
+                "platform": sys.platform
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting system info: {str(e)}")
+            return {"error": str(e)}
 
-    except Exception as e:
-        logging.error(f"Failed to retrieve system status: {e}", exc_info=True)
-        return f"An error occurred while retrieving system status: {e}"
 
-# --- Example Usage (for testing) ---
-if __name__ == "__main__":
-    print("--- Testing Tools ---")
+class CommunicationTools:
+    """Tools for email, messaging, and communication"""
+    
+    @staticmethod
+    def send_email(recipient: str, subject: str, body: str, html_body: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Send an email using configured SMTP settings
+        
+        Args:
+            recipient: Email address of the recipient
+            subject: Email subject
+            body: Plain text email body
+            html_body: Optional HTML body
+            
+        Returns:
+            Dict with send status and details
+        """
+        try:
+            logger.info(f"Sending email to: {recipient}")
+            
+            if not all([config.EMAIL_ADDRESS, config.EMAIL_PASSWORD, config.SMTP_SERVER]):
+                return {
+                    "status": "error",
+                    "message": "Email configuration incomplete"
+                }
+            
+            # Create message
+            msg = MIMEMultipart('alternative')
+            msg['Subject'] = subject
+            msg['From'] = formataddr((config.ASSISTANT_NAME, config.EMAIL_ADDRESS))
+            msg['To'] = recipient
+            
+            # Add plain text body
+            msg.attach(MIMEText(body, 'plain'))
+            
+            # Add HTML body if provided
+            if html_body:
+                msg.attach(MIMEText(html_body, 'html'))
+            
+            # Connect to server and send
+            with smtplib.SMTP(config.SMTP_SERVER, config.SMTP_PORT) as server:
+                server.starttls()
+                server.login(config.EMAIL_ADDRESS, config.EMAIL_PASSWORD)
+                server.send_message(msg)
+            
+            return {
+                "status": "success",
+                "recipient": recipient,
+                "subject": subject,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+        except Exception as e:
+            logger.error(f"Error sending email: {str(e)}")
+            return {
+                "status": "error",
+                "message": str(e)
+            }
+    
+    @staticmethod
+    def send_whatsapp(recipient: str, message: str) -> Dict[str, Any]:
+        """
+        Send a WhatsApp message using Twilio
+        
+        Args:
+            recipient: Phone number of the recipient (with country code)
+            message: Message text
+            
+        Returns:
+            Dict with send status and details
+        """
+        try:
+            logger.info(f"Sending WhatsApp to: {recipient}")
+            
+            if not all([config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN, config.TWILIO_PHONE_NUMBER]):
+                return {
+                    "status": "error",
+                    "message": "Twilio configuration incomplete"
+                }
+            
+            # Initialize Twilio client
+            client = Client(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
+            
+            # Send message
+            twilio_message = client.messages.create(
+                body=message,
+                from_=f"whatsapp:{config.TWILIO_PHONE_NUMBER}",
+                to=f"whatsapp:{recipient}"
+            )
+            
+            return {
+                "status": "success",
+                "recipient": recipient,
+                "message_sid": twilio_message.sid,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+        except Exception as e:
+            logger.error(f"Error sending WhatsApp message: {str(e)}")
+            return {
+                "status": "error",
+                "message": str(e)
+            }
 
-    # Test Web Search
-    print("\nTesting Web Search...")
-    search_result = search_web("What is the weather in London?")
-    print(search_result)
 
-    # Test System Command (Safe command)
-    print("\nTesting System Command (Safe)...")
-    # Use 'dir' on Windows, 'ls -l' on Unix-like
-    safe_cmd = "dir" if os.name == 'nt' else "ls -l"
-    command_result_safe = execute_system_command(safe_cmd)
-    print(command_result_safe)
-
-    # Test System Command (Disallowed command - example)
-    print("\nTesting System Command (Disallowed)...")
-    command_result_unsafe = execute_system_command("rm -rf /") # This should be blocked
-    print(command_result_unsafe)
-
-    # Test System Status
-    print("\nTesting System Status...")
-    status = get_system_status()
-    print(status)
-
-    # Test Email Sending (Requires config.py to be set up)
-    print("\nTesting Email Sending...")
-    if CONFIG_LOADED and SENDER_EMAIL and SMTP_USERNAME: # Basic check if config seems present
-        # Replace with a real recipient for actual testing
-        test_recipient = "test@example.com"
-        print(f"Note: This will attempt to send a real email to {test_recipient} if config.py is set up.")
-        # Uncomment the line below to actually send a test email
-        # email_result = send_email(test_recipient, "CognitoCore Test Email", "This is a test email from CognitoCoreMk1 tools.py.")
-        # print(email_result)
-        print(f"Email test skipped (uncomment in code to run). Requires valid config.py and recipient.")
-
-    else:
-        print("Email test skipped: config.py not found or incomplete.")
-
-    print("\n--- Testing Complete ---")
+class ToolManager:
+    """Manager class for all available tools"""
+    
+    def __init__(self):
+        """Initialize the tool manager"""
+        self.web_tools = WebTools()
+        self.system_tools = SystemTools()
+        self.communication_tools = CommunicationTools()
+        logger.info("ToolManager initialized")
+    
+    def execute_tool(self, tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Execute a specific tool with provided parameters
+        
+        Args:
+            tool_name: Name of the tool to execute
+            params: Parameters for the tool
+            
+        Returns:
+            Result of the tool execution
+        """
+        try:
+            logger.info(f"Executing tool: {tool_name} with params: {params}")
+            
+            # Web tools
+            if tool_name == "web_search":
+                query = params.get("query", "")
+                num_results = params.get("num_results", 5)
+                return {"results": self.web_tools.search_web(query, num_results)}
+            
+            elif tool_name == "fetch_webpage":
+                url = params.get("url", "")
+                return {"content": self.web_tools.fetch_webpage_content(url)}
+            
+            # System tools
+            elif tool_name == "run_command":
+                command = params.get("command", "")
+                safe_mode = params.get("safe_mode", True)
+                return self.system_tools.run_command(command, safe_mode)
+            
+            elif tool_name == "system_info":
+                return {"info": self.system_tools.get_system_info()}
+            
+            # Communication tools
+            elif tool_name == "send_email":
+                recipient = params.get("recipient", "")
+                subject = params.get("subject", "")
+                body = params.get("body", "")
+                html_body = params.get("html_body", None)
+                return self.communication_tools.send_email(recipient, subject, body, html_body)
+            
+            elif tool_name == "send_whatsapp":
+                recipient = params.get("recipient", "")
+                message = params.get("message", "")
+                return self.communication_tools.send_whatsapp(recipient, message)
+            
+            else:
+                return {
+                    "status": "error",
+                    "message": f"Unknown tool: {tool_name}"
+                }
+                
+        except Exception as e:
+            logger.error(f"Error executing tool {tool_name}: {str(e)}")
+            return {
+                "status": "error",
+                "tool": tool_name,
+                "message": str(e)
+            }
