@@ -8,6 +8,7 @@ import pyttsx3
 import logging
 import sys
 import time
+import threading
 
 # Attempt to import configuration, use defaults if not found
 try:
@@ -87,6 +88,16 @@ recognizer = sr.Recognizer()
 recognizer.energy_threshold = ENERGY_THRESHOLD
 recognizer.pause_threshold = PAUSE_THRESHOLD
 
+# --- Control Variables ---
+is_listening_active = False  # Flag to control continuous listening
+listening_thread = None      # Thread for continuous listening
+last_input = None            # Stores the last recognized input
+
+# Constants for control phrases
+STOP_PHRASE = "over and out"
+SHUTDOWN_PHRASE = "go to bed mk1"
+CONTROL_PHRASES = [STOP_PHRASE, SHUTDOWN_PHRASE]
+
 # --- Core Functions ---
 
 def speak(text: str):
@@ -129,16 +140,20 @@ def speak(text: str):
         print(f"Fallback TTS: {text}")
 
 
-def listen() -> str | None:
+def listen(single_phrase=True) -> str | None:
     """
     Listens for audio input from the microphone and transcribes it into text
     using the configured STT engine.
+
+    Args:
+        single_phrase (bool): If True, listens for a single phrase and returns.
+                             If False, listens continuously until stopped.
 
     Returns:
         str | None: The transcribed text, or None if an error occurred or
                     no speech was detected within the time limit.
     """
-    global recognizer # Allow modification for dynamic energy threshold adjustment
+    global recognizer, last_input  # Allow modification for dynamic energy threshold adjustment
 
     # Check available microphones if index is not specified
     if MIC_INDEX is None:
@@ -148,42 +163,108 @@ def listen() -> str | None:
     mic_kwargs = {"device_index": MIC_INDEX} if MIC_INDEX is not None else {}
 
     with sr.Microphone(**mic_kwargs) as source:
-        logger.info("Adjusting for ambient noise... Please wait.")
-        try:
-            # Adjust for ambient noise dynamically (optional but recommended)
-            recognizer.adjust_for_ambient_noise(source, duration=1)
-            logger.info(f"Ambient noise adjustment complete. Energy threshold: {recognizer.energy_threshold:.2f}")
-            logger.info("Listening for command...")
-            speak("Listening...") # Provide feedback to the user
-
+        if single_phrase:
+            logger.info("Adjusting for ambient noise... Please wait.")
             try:
-                # Listen for audio input with a timeout
-                audio = recognizer.listen(
-                    source,
-                    timeout=5, # Max time to wait for speech to start
-                    phrase_time_limit=PHRASE_TIME_LIMIT # Max seconds of speech to record
-                )
-                logger.info("Audio captured, attempting recognition...")
+                # Adjust for ambient noise dynamically (optional but recommended)
+                recognizer.adjust_for_ambient_noise(source, duration=1)
+                logger.info(f"Ambient noise adjustment complete. Energy threshold: {recognizer.energy_threshold:.2f}")
+                logger.info("Listening for command...")
+                speak("Listening...") # Provide feedback to the user
 
-            except sr.WaitTimeoutError:
-                logger.warning("No speech detected within the timeout period.")
-                speak("I didn't hear anything.")
+                try:
+                    # Listen for audio input with a timeout
+                    audio = recognizer.listen(
+                        source,
+                        timeout=5, # Max time to wait for speech to start
+                        phrase_time_limit=PHRASE_TIME_LIMIT # Max seconds of speech to record
+                    )
+                    logger.info("Audio captured, attempting recognition...")
+                    
+                    # Process the audio and return result
+                    return process_audio(audio)
+
+                except sr.WaitTimeoutError:
+                    logger.warning("No speech detected within the timeout period.")
+                    speak("I didn't hear anything.")
+                    return None
+
+            except Exception as e:
+                handle_listening_error(e)
+                return None
+        else:
+            # Continuous listening mode
+            logger.info("Starting continuous listening mode...")
+            try:
+                # Adjust once at the beginning
+                recognizer.adjust_for_ambient_noise(source, duration=1)
+                logger.info(f"Continuous mode - ambient noise adjustment complete. Energy threshold: {recognizer.energy_threshold:.2f}")
+                speak("Listening mode activated.")
+                
+                # Continue listening until the flag is set to False
+                while is_listening_active:
+                    try:
+                        audio = recognizer.listen(
+                            source,
+                            timeout=5,
+                            phrase_time_limit=PHRASE_TIME_LIMIT
+                        )
+                        
+                        # Process the audio
+                        text = process_audio(audio)
+                        
+                        if text:
+                            # Store the recognized text
+                            last_input = text
+                            
+                            # Check for control phrases
+                            if STOP_PHRASE in text.lower():
+                                logger.info("Stop phrase detected. Stopping continuous listening.")
+                                speak("Listening mode deactivated.")
+                                return text
+                            elif SHUTDOWN_PHRASE in text.lower():
+                                logger.info("Shutdown phrase detected.")
+                                return text
+                    
+                    except sr.WaitTimeoutError:
+                        # Just continue listening on timeout
+                        continue
+                    
+                    # Small delay to prevent CPU overload
+                    time.sleep(0.1)
+                
+                logger.info("Continuous listening stopped externally.")
+                return None
+                
+            except Exception as e:
+                handle_listening_error(e)
                 return None
 
-        except OSError as e:
-             logger.error(f"Microphone OS Error: {e}. Check if microphone is connected/available.", exc_info=True)
-             if "Invalid input device" in str(e) and MIC_INDEX is not None:
-                 logger.error(f"Specified MIC_INDEX {MIC_INDEX} might be incorrect.")
-             elif "No Default Input Device Available" in str(e):
-                 logger.error("No default microphone found. Please ensure one is connected and configured.")
-             speak("Sorry, I encountered a problem accessing the microphone.")
-             return None
-        except Exception as e:
-            logger.error(f"An unexpected error occurred during microphone setup or listening: {e}", exc_info=True)
-            speak("Sorry, an unexpected error occurred while trying to listen.")
-            return None
+
+def handle_listening_error(error):
+    """Helper function to handle listening errors"""
+    if isinstance(error, OSError):
+        logger.error(f"Microphone OS Error: {error}. Check if microphone is connected/available.", exc_info=True)
+        if "Invalid input device" in str(error) and MIC_INDEX is not None:
+            logger.error(f"Specified MIC_INDEX {MIC_INDEX} might be incorrect.")
+        elif "No Default Input Device Available" in str(error):
+            logger.error("No default microphone found. Please ensure one is connected and configured.")
+        speak("Sorry, I encountered a problem accessing the microphone.")
+    else:
+        logger.error(f"An unexpected error occurred during microphone setup or listening: {error}", exc_info=True)
+        speak("Sorry, an unexpected error occurred while trying to listen.")
 
 
+def process_audio(audio) -> str | None:
+    """
+    Process audio data using the configured STT engine.
+    
+    Args:
+        audio: Audio data from recognizer.listen()
+        
+    Returns:
+        str | None: Recognized text or None if recognition failed
+    """
     # --- Perform Speech Recognition ---
     if STT_ENGINE_PREFERENCE.lower() == 'google':
         try:
@@ -193,7 +274,6 @@ def listen() -> str | None:
             return text.lower() # Return recognized text in lowercase
         except sr.UnknownValueError:
             logger.warning("Google Web Speech could not understand audio.")
-            speak("Sorry, I couldn't understand what you said.")
             return None
         except sr.RequestError as e:
             logger.error(f"Could not request results from Google Web Speech service; {e}", exc_info=True)
@@ -232,7 +312,6 @@ def listen() -> str | None:
             return text.lower()
         except sr.UnknownValueError:
             logger.warning("Sphinx could not understand audio.")
-            speak("Sorry, I couldn't understand what you said.")
             return None
         except sr.RequestError as e: # May occur if language models aren't found
             logger.error(f"Could not request results from Sphinx; {e}", exc_info=True)
@@ -246,6 +325,47 @@ def listen() -> str | None:
         logger.error(f"Unsupported STT engine configured: {STT_ENGINE_PREFERENCE}")
         speak("Sorry, the configured speech recognition engine is not supported.")
         return None
+
+
+def start_listening_thread():
+    """Start a background thread for continuous listening"""
+    global is_listening_active, listening_thread
+    
+    if listening_thread and listening_thread.is_alive():
+        logger.warning("Listening thread is already active")
+        return
+    
+    is_listening_active = True
+    listening_thread = threading.Thread(target=listen, args=(False,))
+    listening_thread.daemon = True
+    listening_thread.start()
+    logger.info("Started listening thread")
+
+
+def stop_listening_thread():
+    """Stop the continuous listening thread"""
+    global is_listening_active
+    is_listening_active = False
+    logger.info("Stopping listening thread...")
+
+
+def get_last_input():
+    """Return the last recognized input"""
+    global last_input
+    result = last_input
+    last_input = None
+    return result
+
+
+def prompt_for_next_task():
+    """Ask the user what they want to do next"""
+    speak("What would you like me to do next?")
+
+
+def is_active():
+    """Check if the listening thread is active"""
+    global listening_thread, is_listening_active
+    return is_listening_active and (listening_thread and listening_thread.is_alive())
 
 
 # --- Main execution block for testing ---
