@@ -1,0 +1,8 @@
+google-generativeai (for Gemini 2.5 API access)
+requests / beautifulsoup4 (for web scraping/internet access)
+os, subprocess, psutil (for system access and monitoring)
+smtplib, email (for sending emails)
+twilio / other WhatsApp API wrapper (optional, for WhatsApp messaging)
+SpeechRecognition / whisper (for voice input)
+pyttsx3 / gTTS (for voice output)
+python-dotenv (for secure API key management)
