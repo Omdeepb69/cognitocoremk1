@@ -2,6 +2,8 @@
 CognitoCoreMk1 - Your Python-powered AI sidekick
 Main application that ties all components together
 """
+
+#just for the commit of the day
 import os
 import time
 import threading
